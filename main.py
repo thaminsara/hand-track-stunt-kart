@@ -9,6 +9,7 @@ import random
 try:
     import cv2
     import numpy as np
+    import mediapipe as mp
     from ursina import *
 except ImportError as e:
     print(f"Missing dependency: {e}. Please run update-and-run.ps1 to install requirements.")
@@ -35,10 +36,16 @@ class HandTrackerThread(threading.Thread):
 
     def run(self):
         global steering_val, throttle_val, boost_active, camera_active
+        mp_hands = mp.solutions.hands
+        hands = mp_hands.Hands(
+            max_num_hands=2,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
+        )
+        mp_draw = mp.solutions.drawing_utils
         cap = cv2.VideoCapture(0)
         
-        print("Robust Hand Motion & Contour Tracker Initialized.")
-        bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=50, varThreshold=25, detectShadows=False)
+        print("MediaPipe Hand Skeleton Tracker Initialized.")
 
         while self.running:
             if not camera_active:
@@ -51,66 +58,48 @@ class HandTrackerThread(threading.Thread):
 
             frame = cv2.flip(frame, 1)
             h, w, _ = frame.shape
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(rgb)
 
             global steering_val, throttle_val, boost_active
-            try:
-                # 1. Background subtraction to ignore stationary background (curtains, walls)
-                fg_mask = bg_subtractor.apply(frame)
-                
-                # Clean noise
-                kernel = np.ones((5,5), np.uint8)
-                fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-                fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
-
-                # 2. HSV Skin color filtering
-                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                lower_skin = np.array([0, 30, 60], dtype=np.uint8)
-                upper_skin = np.array([25, 220, 255], dtype=np.uint8)
-                skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
-
-                # Combine motion mask and skin mask
-                combined_mask = cv2.bitwise_and(fg_mask, skin_mask)
-
-                contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                hand_found = False
-                if contours:
-                    # Filter contours by realistic hand size (ignore tiny noise and giant background objects)
-                    valid_contours = [c for c in contours if 1500 < cv2.contourArea(c) < 40000]
+            if results.multi_hand_landmarks:
+                hand_coords = []
+                for hand_landmarks in results.multi_hand_landmarks:
+                    # Draw skeleton landmarks on the live OpenCV window
+                    mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
                     
-                    if valid_contours:
-                        # Pick the largest valid contour (likely the hand)
-                        best_contour = max(valid_contours, key=cv2.contourArea)
-                        M = cv2.moments(best_contour)
-                        if M["m00"] > 0:
-                            cx = int(M["m10"] / M["m00"])
-                            cy = int(M["m01"] / M["m00"])
-                            
-                            # Draw visual feedback
-                            cv2.circle(frame, (cx, cy), 18, (0, 255, 0), -1)
-                            cv2.drawContours(frame, [best_contour], -1, (0, 0, 255), 2)
-                            
-                            # Map coordinates for steering & throttle
-                            steering_val = max(-1.0, min(1.0, (cx - (w / 2)) / (w / 3.0)))
-                            throttle_val = max(0.2, min(1.0, 1.0 - (cy / h)))
-                            boost_active = True if cv2.contourArea(best_contour) > 15000 else False
-                            hand_found = True
+                    # Track wrist (0) and index finger tip (8)
+                    wx = hand_landmarks.landmark[0].x * w
+                    wy = hand_landmarks.landmark[0].y * h
+                    ix = hand_landmarks.landmark[8].x * w
+                    iy = hand_landmarks.landmark[8].y * h
+                    hand_coords.append(((wx + ix)/2, (wy + iy)/2))
 
-                if not hand_found:
-                    # Smoothly decay to center when hands not detected
-                    steering_val = steering_val * 0.85
-                    throttle_val = 0.5
+                if len(hand_coords) >= 2:
+                    # Two hands: Virtual steering wheel mode
+                    p1, p2 = hand_coords[0], hand_coords[1]
+                    dx = p2[0] - p1[0]
+                    dy = p2[1] - p1[1]
+                    angle = math.atan2(dy, dx)
+                    steering_val = max(-1.0, min(1.0, angle * 2.0))
+                    
+                    avg_y = (p1[1] + p2[1]) / 2.0
+                    throttle_val = max(0.2, min(1.0, 1.0 - (avg_y / h)))
+                    boost_active = True if abs(dx) < w * 0.15 else False
+                elif len(hand_coords) == 1:
+                    # Single hand mode
+                    hx, hy = hand_coords[0]
+                    steering_val = max(-1.0, min(1.0, (hx - (w/2)) / (w/4)))
+                    throttle_val = max(0.2, min(1.0, 1.0 - (hy / h)))
                     boost_active = False
-
-                # Show live visualizer window
-                cv2.imshow("Hand-Track Stunt Kart - Live Webcam Feed", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-
-            except Exception as e:
-                steering_val = 0.0
+            else:
+                steering_val = steering_val * 0.85
                 throttle_val = 0.5
                 boost_active = False
+
+            cv2.imshow("Hand-Track Stunt Kart - Live Skeleton Tracking", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
             time.sleep(0.015)
         cap.release()
@@ -223,10 +212,10 @@ menu_parent = Entity()
 hud_parent = Entity(enabled=False)
 
 title_text = Text(parent=menu_parent, text="HAND-TRACK STUNT KART", scale=3, origin=(0,0), y=0.3, color=color.orange)
-subtitle_text = Text(parent=menu_parent, text="Webcam background subtraction & motion hand tracker active!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
+subtitle_text = Text(parent=menu_parent, text="MediaPipe Hand Skeleton Tracker active!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
 
 hud_speed = Text(parent=hud_parent, text="SPEED: 0 MPH", scale=1.5, position=(-0.85, 0.45), color=color.yellow)
-hud_status = Text(parent=hud_parent, text="Tracker: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
+hud_status = Text(parent=hud_parent, text="Hand Skeleton Tracker: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
 
 def start_singleplayer():
     global current_state, player_kart
@@ -256,7 +245,7 @@ def update():
             hud_status.text = "NITRO BOOST ACTIVE!"
             hud_status.color = color.magenta
         else:
-            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}% (Active)"
+            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}% (Hand Active)"
             hud_status.color = color.green
 
 app.run()
