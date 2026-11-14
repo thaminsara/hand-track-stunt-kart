@@ -9,7 +9,6 @@ import random
 try:
     import cv2
     import numpy as np
-    import mediapipe as mp
     from ursina import *
 except ImportError as e:
     print(f"Missing dependency: {e}. Please run update-and-run.ps1 to install requirements.")
@@ -38,19 +37,7 @@ class HandTrackerThread(threading.Thread):
         global steering_val, throttle_val, boost_active, camera_active
         cap = cv2.VideoCapture(0)
         
-        # Try initializing MediaPipe Hands (supporting both legacy and modern API versions)
-        hands = None
-        use_tasks_api = False
-        try:
-            if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'hands'):
-                mp_hands = mp.solutions.hands
-                hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.6, min_tracking_confidence=0.6)
-            else:
-                # Modern MediaPipe / Python 3.13 fallback: use OpenCV motion/color tracking if solutions unavailable
-                use_tasks_api = True
-        except Exception as e:
-            print(f"Hand tracker init notice: {e}. Using keyboard/mouse racing mode.")
-            use_tasks_api = True
+        print("Hand Tracking Vision Engine Initialized (OpenCV Skin-Blob & Motion Tracking).")
 
         while self.running:
             if not camera_active:
@@ -65,44 +52,52 @@ class HandTrackerThread(threading.Thread):
             h, w, _ = frame.shape
 
             global steering_val, throttle_val, boost_active
-            
-            if not use_tasks_api and hands is not None:
-                try:
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    results = hands.process(rgb)
-                    if results.multi_hand_landmarks:
-                        hand_coords = []
-                        for hand_landmarks in results.multi_hand_landmarks:
-                            wx = hand_landmarks.landmark[0].x * w
-                            wy = hand_landmarks.landmark[0].y * h
-                            ix = hand_landmarks.landmark[8].x * w
-                            iy = hand_landmarks.landmark[8].y * h
-                            hand_coords.append(((wx + ix)/2, (wy + iy)/2))
+            try:
+                # Convert to HSV for robust skin color detection
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                
+                # Define broad skin color range in HSV
+                lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+                upper_skin = np.array([25, 255, 255], dtype=np.uint8)
+                
+                mask = cv2.inRange(hsv, lower_skin, upper_skin)
+                
+                # Morphological operations to clean noise
+                kernel = np.ones((3,3), np.uint8)
+                mask = cv2.dilate(mask, kernel, iterations=2)
+                mask = cv2.erode(mask, kernel, iterations=1)
 
-                        if len(hand_coords) >= 2:
-                            p1, p2 = hand_coords[0], hand_coords[1]
-                            dx = p2[0] - p1[0]
-                            dy = p2[1] - p1[1]
-                            angle = math.atan2(dy, dx)
-                            steering_val = max(-1.0, min(1.0, angle * 2.0))
-                            avg_y = (p1[1] + p2[1]) / 2.0
-                            throttle_val = max(0.2, min(1.0, 1.0 - (avg_y / h)))
-                            boost_active = True if abs(dx) < w * 0.15 else False
-                        elif len(hand_coords) == 1:
-                            hx, hy = hand_coords[0]
-                            steering_val = max(-1.0, min(1.0, (hx - (w/2)) / (w/4)))
-                            throttle_val = max(0.2, min(1.0, 1.0 - (hy / h)))
-                            boost_active = False
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                if contours:
+                    # Find the largest skin-colored contour (the player's hand/hands)
+                    largest_contour = max(contours, key=cv2.contourArea)
+                    area = cv2.contourArea(largest_contour)
+                    
+                    if area > 3000: # Minimum size threshold to ignore tiny specks
+                        M = cv2.moments(largest_contour)
+                        if M["m00"] > 0:
+                            cx = int(M["m10"] / M["m00"])
+                            cy = int(M["m01"] / M["m00"])
+                            
+                            # Map X coordinate to steering (-1 to 1)
+                            steering_val = max(-1.0, min(1.0, (cx - (w / 2)) / (w / 3.5)))
+                            
+                            # Map Y coordinate to throttle (higher up = faster, lower = slower)
+                            throttle_val = max(0.2, min(1.0, 1.0 - (cy / h)))
+                            
+                            # If contour is large or moving fast, trigger boost
+                            boost_active = True if area > 25000 else False
                     else:
-                        steering_val = 0.0
+                        # Fallback to smooth neutral if hand is too far / small
+                        steering_val = steering_val * 0.9
                         throttle_val = 0.5
                         boost_active = False
-                except Exception:
-                    steering_val = 0.0
+                else:
+                    steering_val = steering_val * 0.9
                     throttle_val = 0.5
                     boost_active = False
-            else:
-                # Fallback interactive mode using center mass / brightness motion or neutral steering
+            except Exception as e:
                 steering_val = 0.0
                 throttle_val = 0.5
                 boost_active = False
@@ -217,10 +212,10 @@ menu_parent = Entity()
 hud_parent = Entity(enabled=False)
 
 title_text = Text(parent=menu_parent, text="HAND-TRACK STUNT KART", scale=3, origin=(0,0), y=0.3, color=color.orange)
-subtitle_text = Text(parent=menu_parent, text="Control your supercar using webcam virtual steering or WASD!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
+subtitle_text = Text(parent=menu_parent, text="Control your supercar using webcam hand tracking or WASD!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
 
 hud_speed = Text(parent=hud_parent, text="SPEED: 0 MPH", scale=1.5, position=(-0.85, 0.45), color=color.yellow)
-hud_status = Text(parent=hud_parent, text="Racing Mode: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
+hud_status = Text(parent=hud_parent, text="Hand Tracking: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
 
 def start_singleplayer():
     global current_state, player_kart
@@ -241,7 +236,7 @@ def start_lan_join():
 Button(parent=menu_parent, text="SOLO PRACTICE", color=color.azure, scale=(0.4, 0.08), y=0.0, on_click=start_singleplayer)
 Button(parent=menu_parent, text="HOST LAN MATCH", color=color.violet, scale=(0.4, 0.08), y=-0.1, on_click=start_lan_host)
 Button(parent=menu_parent, text="JOIN LAN MATCH", color=color.blue, scale=(0.4, 0.08), y=-0.2, on_click=start_lan_join)
-Button(parent=menu_parent, text="QUIT", color=color.red, scale=(0.4, 0.08), y=-0.3, on_click=application.quit)
+Button(parent=menu_parent, target=None, text="QUIT", color=color.red, scale=(0.4, 0.08), y=-0.3, on_click=application.quit)
 
 def update():
     if current_state == "GAME" and player_kart:
@@ -250,7 +245,7 @@ def update():
             hud_status.text = "NITRO BOOST ACTIVE!"
             hud_status.color = color.magenta
         else:
-            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}% (WASD active)"
+            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}% (Hand/WASD)"
             hud_status.color = color.green
 
 app.run()
