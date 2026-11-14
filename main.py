@@ -5,10 +5,14 @@ import threading
 import time
 import math
 import random
+import urllib.request
 
 try:
     import cv2
     import numpy as np
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
     from ursina import *
 except ImportError as e:
     print(f"Missing dependency: {e}. Please run update-and-run.ps1 to install requirements.")
@@ -38,9 +42,29 @@ class HandTrackerThread(threading.Thread):
 
     def run(self):
         global steering_val, throttle_val, is_reverse, boost_active, camera_active
+        
+        # Ensure official Google MediaPipe hand_landmarker.task model is downloaded locally
+        model_path = "hand_landmarker.task"
+        if not os.path.exists(model_path):
+            print("Downloading Google MediaPipe Hand Landmarker model...")
+            try:
+                url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+                urllib.request.urlretrieve(url, model_path)
+                print("Model downloaded successfully!")
+            except Exception as e:
+                print(f"Failed to download model: {e}")
+
         cap = cv2.VideoCapture(0)
         
-        print("Precise Gesture Hand Tracker Initialized (Left: Throttle/Stop/Reverse | Right: Steering).")
+        # Initialize Google MediaPipe Tasks Vision HandLandmarker (Modern API compatible with Python 3.13)
+        detector = None
+        try:
+            base_options = python.BaseOptions(model_asset_path=model_path)
+            options = vision.HandLandmarkerOptions(base_options=base_options, num_hands=2, min_hand_detection_confidence=0.6, min_hand_presence_confidence=0.6, min_tracking_confidence=0.6)
+            detector = vision.HandLandmarker.create_from_options(options)
+            print("Google MediaPipe Tasks HandLandmarker Initialized Successfully.")
+        except Exception as e:
+            print(f"MediaPipe Tasks init notice: {e}. Falling back to robust frame tracking.")
 
         while self.running:
             if not camera_active:
@@ -56,71 +80,84 @@ class HandTrackerThread(threading.Thread):
 
             global steering_val, throttle_val, is_reverse, boost_active
             try:
-                # Split frame in half: Left side for left hand (throttle), Right side for right hand (steering)
-                mid_x = w // 2
-                left_region = frame[:, :mid_x]
-                right_region = frame[:, mid_x:]
-
-                # 1. LEFT HAND GESTURE DETECTION (Throttle / Stop / Reverse)
-                # Convert to grayscale / motion or contour
-                gray_l = cv2.cvtColor(left_region, cv2.COLOR_BGR2GRAY)
-                blur_l = cv2.GaussianBlur(gray_l, (5, 5), 0)
-                _, thresh_l = cv2.threshold(blur_l, 60, 255, cv2.THRESH_BINARY_INV)
-                contours_l, _ = cv2.findContours(thresh_l, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
                 left_action = "STOP"
-                if contours_l:
-                    best_l = max(contours_l, key=cv2.contourArea)
-                    if cv2.contourArea(best_l) > 3000:
-                        # Check convexity defects or palm solidity to determine open palm vs closed/back hand
-                        hull = cv2.convexHull(best_l)
-                        area = cv2.contourArea(best_l)
-                        hull_area = cv2.contourArea(hull)
-                        solidity = float(area) / hull_area if hull_area > 0 else 0
+                right_steer_detected = False
 
-                        # Open hand has lower solidity due to fingers spreading out -> STOP
-                        if solidity < 0.75:
-                            left_action = "STOP"
-                            throttle_val = 0.0
-                            is_reverse = False
-                        else:
-                            # Palm showing vs back of hand (estimated via brightness/color gradient or vertical position)
-                            M = cv2.moments(best_l)
-                            if M["m00"] > 0:
-                                cy = int(M["m01"] / M["m00"])
-                                if cy < h / 2:
-                                    left_action = "FORWARD"
-                                    throttle_val = 1.0
+                if detector is not None:
+                    # Convert OpenCV BGR frame to MediaPipe Image format
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    detection_result = detector.detect(mp_image)
+
+                    if detection_result and detection_result.hand_landmarks:
+                        for idx, hand_landmarks in enumerate(detection_result.hand_landmarks):
+                            handedness = detection_result.handedness[idx][0].category_name # "Left" or "Right" from camera view
+
+                            # Draw landmarks as circles on frame
+                            x_coords = [int(lm.x * w) for lm in hand_landmarks]
+                            y_coords = [int(lm.y * h) for lm in hand_landmarks]
+                            
+                            cx = int(sum(x_coords) / len(x_coords))
+                            cy = int(sum(y_coords) / len(y_coords))
+
+                            # Identify Left Hand vs Right Hand from viewer perspective
+                            if handedness == "Left":
+                                # LEFT HAND RULES:
+                                # Check open palm vs closed/backhand using finger extension (wrist vs fingertips distance)
+                                wrist = hand_landmarks[0]
+                                middle_tip = hand_landmarks[12]
+                                palm_spread = math.hypot(middle_tip.x - wrist.x, middle_tip.y - wrist.y)
+
+                                if palm_spread < 0.22: # Open palm (fingers spread / close)
+                                    left_action = "STOP"
+                                    throttle_val = 0.0
                                     is_reverse = False
                                 else:
-                                    left_action = "BACKWARD"
-                                    throttle_val = 0.8
-                                    is_reverse = True
+                                    # Forward vs Backward based on hand orientation / Z coordinate or height
+                                    if middle_tip.z < wrist.z: # Palm facing camera
+                                        left_action = "FORWARD"
+                                        throttle_val = 1.0
+                                        is_reverse = False
+                                    else: # Back of hand facing camera
+                                        left_action = "BACKWARD"
+                                        throttle_val = 0.8
+                                        is_reverse = True
 
-                # 2. RIGHT HAND GESTURE DETECTION (Steering by tilting)
-                gray_r = cv2.cvtColor(right_region, cv2.COLOR_BGR2GRAY)
-                blur_r = cv2.GaussianBlur(gray_r, (5, 5), 0)
-                _, thresh_r = cv2.threshold(blur_r, 60, 255, cv2.THRESH_BINARY_INV)
-                contours_r, _ = cv2.findContours(thresh_r, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                cv2.circle(frame, (cx, cy), 25, (0, 255, 255), -1)
+                                cv2.putText(frame, f"L: {left_action}", (cx - 40, cy - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                if contours_r:
-                    best_r = max(contours_r, key=cv2.contourArea)
-                    if cv2.contourArea(best_r) > 3000:
-                        # Use centroid X relative to center of right region for steering tilt
-                        M_r = cv2.moments(best_r)
-                        if M_r["m00"] > 0:
-                            cx_r = int(M_r["m10"] / M_r["m00"])
-                            region_center_x = (w / 4)
-                            steering_val = max(-1.0, min(1.0, (cx_r - region_center_x) / (region_center_x * 0.8)))
+                            elif handedness == "Right":
+                                # RIGHT HAND RULES: Steering tilt based on X position relative to frame center
+                                right_steer_detected = True
+                                steering_val = max(-1.0, min(1.0, (cx - (w / 2)) / (w / 3.0)))
+                                cv2.circle(frame, (cx, cy), 25, (0, 255, 0), -1)
+                                cv2.putText(frame, f"R: Steer {int(steering_val*100)}%", (cx - 40, cy - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                    if not detection_result or not detection_result.hand_landmarks:
+                        throttle_val = 0.0
+                        steering_val = steering_val * 0.85
+                        is_reverse = False
                 else:
-                    steering_val = steering_val * 0.85
+                    # Fallback region tracking if detector fails to load
+                    mid_x = w // 2
+                    left_region = frame[:, :mid_x]
+                    right_region = frame[:, mid_x:]
+                    gray_l = cv2.cvtColor(left_region, cv2.COLOR_BGR2GRAY)
+                    _, thresh_l = cv2.threshold(cv2.GaussianBlur(gray_l, (5,5), 0), 50, 255, cv2.THRESH_BINARY_INV)
+                    contours_l, _ = cv2.findContours(thresh_l, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if contours_l:
+                        best_l = max(contours_l, key=cv2.contourArea)
+                        if cv2.contourArea(best_l) > 4000:
+                            throttle_val = 1.0
+                            left_action = "FORWARD"
+                    else:
+                        throttle_val = 0.0
+                        left_action = "STOP"
 
-                # Draw visual dashboard on live camera feed
-                cv2.putText(frame, f"Left Hand [Throttle]: {left_action}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                cv2.putText(frame, f"Right Hand [Steer]: {int(steering_val*100)}%", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.line(frame, (mid_x, 0), (mid_x, h), (255, 255, 255), 2)
+                    steering_val = 0.0
 
-                cv2.imshow("Hand-Track Stunt Kart - Gesture Control Feed", frame)
+                # Show live tracking dashboard
+                cv2.putText(frame, f"Throttle: {left_action} | Steer: {int(steering_val*100)}%", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.imshow("Hand-Track Stunt Kart - Google MediaPipe Vision", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
@@ -155,7 +192,6 @@ class StuntKart(Entity):
         self.acceleration = 12.0
         self.turn_speed = 90.0
         
-        # Visual additions (Wheels & Spoiler)
         self.body = Entity(parent=self, model='cube', color=color.dark_gray, scale=(1.1, 0.4, 0.8), y=0.4)
         self.spoiler = Entity(parent=self, model='cube', color=color.black, scale=(1.2, 0.1, 0.4), z=-1.3, y=0.8)
 
@@ -176,7 +212,6 @@ class StuntKart(Entity):
                 accel_input = 0.8
                 is_reverse = True
 
-            # Acceleration & physics
             if accel_input > 0.1:
                 if is_reverse:
                     self.speed -= self.acceleration * time.dt * accel_input
@@ -185,7 +220,6 @@ class StuntKart(Entity):
                     self.speed += self.acceleration * time.dt * accel_input
                     self.speed = min(self.max_speed, self.speed)
             else:
-                # Friction / Stop
                 if self.speed > 0:
                     self.speed -= self.acceleration * 1.5 * time.dt
                     self.speed = max(0.0, self.speed)
@@ -193,21 +227,17 @@ class StuntKart(Entity):
                     self.speed += self.acceleration * 1.5 * time.dt
                     self.speed = min(0.0, self.speed)
 
-            # Turning (reverse steering when going backwards)
             turn_dir = -1.0 if is_reverse else 1.0
             self.rotation_y += steer_input * self.turn_speed * time.dt * (abs(self.speed) / self.max_speed + 0.2) * turn_dir
 
-            # Move based on rotation
             move_dir = self.forward if not is_reverse else -self.forward
             self.position += move_dir * abs(self.speed) * time.dt
 
-            # Gravity / Ground check
             if self.y > 0.4:
                 self.y -= 15.0 * time.dt
             else:
                 self.y = 0.4
 
-            # Camera follow
             camera.position = lerp(camera.position, self.position - (self.forward * 10) + Vec3(0, 4, 0), 10 * time.dt)
             camera.look_at(self.position + Vec3(0, 1, 0))
 
@@ -238,7 +268,6 @@ class Floor(Entity):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-# UI Screens
 menu_parent = Entity()
 hud_parent = Entity(enabled=False)
 
@@ -246,7 +275,7 @@ Text(parent=menu_parent, text="HAND-TRACK STUNT KART", scale=3, origin=(0,0), y=
 Text(parent=menu_parent, text="Left Hand: Open=Stop | Palm=Forward | Back=Backward\nRight Hand: Tilt=Steer", scale=1.0, origin=(0,0), y=0.18, color=color.light_gray)
 
 hud_speed = Text(parent=hud_parent, text="SPEED: 0 MPH", scale=1.5, position=(-0.85, 0.45), color=color.yellow)
-hud_status = Text(parent=hud_parent, text="Gesture Control Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
+hud_status = Text(parent=hud_parent, text="Google MediaPipe Vision Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
 
 def start_singleplayer():
     global current_state, player_kart

@@ -2,3 +2,4 @@ ursina>=3.6.0
 mediapipe>=0.10.30
 opencv-python>=4.10.0
 numpy>=1.26.4
+requests>=2.31.0
