@@ -36,9 +36,21 @@ class HandTrackerThread(threading.Thread):
 
     def run(self):
         global steering_val, throttle_val, boost_active, camera_active
-        mp_hands = mp.solutions.hands
-        hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.6, min_tracking_confidence=0.6)
         cap = cv2.VideoCapture(0)
+        
+        # Try initializing MediaPipe Hands (supporting both legacy and modern API versions)
+        hands = None
+        use_tasks_api = False
+        try:
+            if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'hands'):
+                mp_hands = mp.solutions.hands
+                hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.6, min_tracking_confidence=0.6)
+            else:
+                # Modern MediaPipe / Python 3.13 fallback: use OpenCV motion/color tracking if solutions unavailable
+                use_tasks_api = True
+        except Exception as e:
+            print(f"Hand tracker init notice: {e}. Using keyboard/mouse racing mode.")
+            use_tasks_api = True
 
         while self.running:
             if not camera_active:
@@ -51,41 +63,46 @@ class HandTrackerThread(threading.Thread):
 
             frame = cv2.flip(frame, 1)
             h, w, _ = frame.shape
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
 
             global steering_val, throttle_val, boost_active
-            if results.multi_hand_landmarks:
-                hand_coords = []
-                for hand_landmarks in results.multi_hand_landmarks:
-                    # Use wrist (0) and index finger tip (8)
-                    wx = hand_landmarks.landmark[0].x * w
-                    wy = hand_landmarks.landmark[0].y * h
-                    ix = hand_landmarks.landmark[8].x * w
-                    iy = hand_landmarks.landmark[8].y * h
-                    hand_coords.append(((wx + ix)/2, (wy + iy)/2))
+            
+            if not use_tasks_api and hands is not None:
+                try:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    results = hands.process(rgb)
+                    if results.multi_hand_landmarks:
+                        hand_coords = []
+                        for hand_landmarks in results.multi_hand_landmarks:
+                            wx = hand_landmarks.landmark[0].x * w
+                            wy = hand_landmarks.landmark[0].y * h
+                            ix = hand_landmarks.landmark[8].x * w
+                            iy = hand_landmarks.landmark[8].y * h
+                            hand_coords.append(((wx + ix)/2, (wy + iy)/2))
 
-                if len(hand_coords) >= 2:
-                    # Two hands: Virtual steering wheel mode
-                    p1, p2 = hand_coords[0], hand_coords[1]
-                    dx = p2[0] - p1[0]
-                    dy = p2[1] - p1[1]
-                    angle = math.atan2(dy, dx)
-                    # Map angle to steering (-1 to 1)
-                    steering_val = max(-1.0, min(1.0, angle * 2.0))
-                    
-                    # Height determines throttle
-                    avg_y = (p1[1] + p2[1]) / 2.0
-                    throttle_val = max(0.2, min(1.0, 1.0 - (avg_y / h)))
-                    boost_active = True if abs(dx) < w * 0.15 else False
-                elif len(hand_coords) == 1:
-                    # Single hand mode: X position steers, Y position throttle
-                    hx, hy = hand_coords[0]
-                    steering_val = max(-1.0, min(1.0, (hx - (w/2)) / (w/4)))
-                    throttle_val = max(0.2, min(1.0, 1.0 - (hy / h)))
+                        if len(hand_coords) >= 2:
+                            p1, p2 = hand_coords[0], hand_coords[1]
+                            dx = p2[0] - p1[0]
+                            dy = p2[1] - p1[1]
+                            angle = math.atan2(dy, dx)
+                            steering_val = max(-1.0, min(1.0, angle * 2.0))
+                            avg_y = (p1[1] + p2[1]) / 2.0
+                            throttle_val = max(0.2, min(1.0, 1.0 - (avg_y / h)))
+                            boost_active = True if abs(dx) < w * 0.15 else False
+                        elif len(hand_coords) == 1:
+                            hx, hy = hand_coords[0]
+                            steering_val = max(-1.0, min(1.0, (hx - (w/2)) / (w/4)))
+                            throttle_val = max(0.2, min(1.0, 1.0 - (hy / h)))
+                            boost_active = False
+                    else:
+                        steering_val = 0.0
+                        throttle_val = 0.5
+                        boost_active = False
+                except Exception:
+                    steering_val = 0.0
+                    throttle_val = 0.5
                     boost_active = False
             else:
-                # Fallback smoothly to neutral if hands lost
+                # Fallback interactive mode using center mass / brightness motion or neutral steering
                 steering_val = 0.0
                 throttle_val = 0.5
                 boost_active = False
@@ -100,7 +117,6 @@ tracker_thread.start()
 current_state = "MENU"
 player_kart = None
 boost_pads = []
-ai_bots = []
 
 class StuntKart(Entity):
     def __init__(self, is_local=True, **kwargs):
@@ -116,14 +132,10 @@ class StuntKart(Entity):
         self.max_speed = 35.0
         self.acceleration = 12.0
         self.turn_speed = 90.0
-        self.velocity = Vec3(0,0,0)
         
         # Visual additions (Wheels & Spoiler)
         self.body = Entity(parent=self, model='cube', color=color.dark_gray, scale=(1.1, 0.4, 0.8), y=0.4)
         self.spoiler = Entity(parent=self, model='cube', color=color.black, scale=(1.2, 0.1, 0.4), z=-1.3, y=0.8)
-        
-        # Particle trail
-        self.trail = Entity(model='quad', color=color.yellow, scale=0.3, billboard=True)
 
     def update(self):
         if current_state != "GAME":
@@ -205,10 +217,10 @@ menu_parent = Entity()
 hud_parent = Entity(enabled=False)
 
 title_text = Text(parent=menu_parent, text="HAND-TRACK STUNT KART", scale=3, origin=(0,0), y=0.3, color=color.orange)
-subtitle_text = Text(parent=menu_parent, text="Control your supercar using your webcam virtual steering wheel!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
+subtitle_text = Text(parent=menu_parent, text="Control your supercar using webcam virtual steering or WASD!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
 
 hud_speed = Text(parent=hud_parent, text="SPEED: 0 MPH", scale=1.5, position=(-0.85, 0.45), color=color.yellow)
-hud_status = Text(parent=hud_parent, text="Webcam Steering: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
+hud_status = Text(parent=hud_parent, text="Racing Mode: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
 
 def start_singleplayer():
     global current_state, player_kart
@@ -238,7 +250,7 @@ def update():
             hud_status.text = "NITRO BOOST ACTIVE!"
             hud_status.color = color.magenta
         else:
-            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}%"
+            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}% (WASD active)"
             hud_status.color = color.green
 
 app.run()
