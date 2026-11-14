@@ -37,7 +37,8 @@ class HandTrackerThread(threading.Thread):
         global steering_val, throttle_val, boost_active, camera_active
         cap = cv2.VideoCapture(0)
         
-        print("Hand Tracking & Live Webcam Feed Initialized.")
+        print("Robust Hand Motion & Contour Tracker Initialized.")
+        bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=50, varThreshold=25, detectShadows=False)
 
         while self.running:
             if not camera_active:
@@ -53,46 +54,55 @@ class HandTrackerThread(threading.Thread):
 
             global steering_val, throttle_val, boost_active
             try:
-                # HSV skin-blob and hand motion tracking
-                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                lower_skin = np.array([0, 20, 70], dtype=np.uint8)
-                upper_skin = np.array([25, 255, 255], dtype=np.uint8)
+                # 1. Background subtraction to ignore stationary background (curtains, walls)
+                fg_mask = bg_subtractor.apply(frame)
                 
-                mask = cv2.inRange(hsv, lower_skin, upper_skin)
-                kernel = np.ones((3,3), np.uint8)
-                mask = cv2.dilate(mask, kernel, iterations=2)
-                mask = cv2.erode(mask, kernel, iterations=1)
+                # Clean noise
+                kernel = np.ones((5,5), np.uint8)
+                fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+                fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
 
-                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                # 2. HSV Skin color filtering
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                lower_skin = np.array([0, 30, 60], dtype=np.uint8)
+                upper_skin = np.array([25, 220, 255], dtype=np.uint8)
+                skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
+
+                # Combine motion mask and skin mask
+                combined_mask = cv2.bitwise_and(fg_mask, skin_mask)
+
+                contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
+                hand_found = False
                 if contours:
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    area = cv2.contourArea(largest_contour)
+                    # Filter contours by realistic hand size (ignore tiny noise and giant background objects)
+                    valid_contours = [c for c in contours if 1500 < cv2.contourArea(c) < 40000]
                     
-                    if area > 3000:
-                        M = cv2.moments(largest_contour)
+                    if valid_contours:
+                        # Pick the largest valid contour (likely the hand)
+                        best_contour = max(valid_contours, key=cv2.contourArea)
+                        M = cv2.moments(best_contour)
                         if M["m00"] > 0:
                             cx = int(M["m10"] / M["m00"])
                             cy = int(M["m01"] / M["m00"])
                             
-                            # Draw live tracking visual on the webcam window so the user sees their hand being tracked!
-                            cv2.circle(frame, (cx, cy), 15, (0, 255, 0), -1)
-                            cv2.drawContours(frame, [largest_contour], -1, (255, 0, 0), 2)
+                            # Draw visual feedback
+                            cv2.circle(frame, (cx, cy), 18, (0, 255, 0), -1)
+                            cv2.drawContours(frame, [best_contour], -1, (0, 0, 255), 2)
                             
-                            # Map coordinates
-                            steering_val = max(-1.0, min(1.0, (cx - (w / 2)) / (w / 3.5)))
+                            # Map coordinates for steering & throttle
+                            steering_val = max(-1.0, min(1.0, (cx - (w / 2)) / (w / 3.0)))
                             throttle_val = max(0.2, min(1.0, 1.0 - (cy / h)))
-                            boost_active = True if area > 25000 else False
-                    else:
-                        steering_val = steering_val * 0.9
-                        throttle_val = 0.5
-                        boost_active = False
-                else:
-                    steering_val = steering_val * 0.9
+                            boost_active = True if cv2.contourArea(best_contour) > 15000 else False
+                            hand_found = True
+
+                if not hand_found:
+                    # Smoothly decay to center when hands not detected
+                    steering_val = steering_val * 0.85
                     throttle_val = 0.5
                     boost_active = False
 
-                # Show live OpenCV window with hand tracking visualizer!
+                # Show live visualizer window
                 cv2.imshow("Hand-Track Stunt Kart - Live Webcam Feed", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
@@ -213,10 +223,10 @@ menu_parent = Entity()
 hud_parent = Entity(enabled=False)
 
 title_text = Text(parent=menu_parent, text="HAND-TRACK STUNT KART", scale=3, origin=(0,0), y=0.3, color=color.orange)
-subtitle_text = Text(parent=menu_parent, text="Webcam tracker active with live visual feed window!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
+subtitle_text = Text(parent=menu_parent, text="Webcam background subtraction & motion hand tracker active!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
 
 hud_speed = Text(parent=hud_parent, text="SPEED: 0 MPH", scale=1.5, position=(-0.85, 0.45), color=color.yellow)
-hud_status = Text(parent=hud_parent, text="Webcam Visualizer: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
+hud_status = Text(parent=hud_parent, text="Tracker: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
 
 def start_singleplayer():
     global current_state, player_kart
@@ -246,7 +256,7 @@ def update():
             hud_status.text = "NITRO BOOST ACTIVE!"
             hud_status.color = color.magenta
         else:
-            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}% (Cam Active)"
+            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}% (Active)"
             hud_status.color = color.green
 
 app.run()
