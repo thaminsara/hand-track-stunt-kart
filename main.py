@@ -37,7 +37,7 @@ class HandTrackerThread(threading.Thread):
         global steering_val, throttle_val, boost_active, camera_active
         cap = cv2.VideoCapture(0)
         
-        print("Hand Tracking Vision Engine Initialized (OpenCV Skin-Blob & Motion Tracking).")
+        print("Hand Tracking & Live Webcam Feed Initialized.")
 
         while self.running:
             if not camera_active:
@@ -53,16 +53,12 @@ class HandTrackerThread(threading.Thread):
 
             global steering_val, throttle_val, boost_active
             try:
-                # Convert to HSV for robust skin color detection
+                # HSV skin-blob and hand motion tracking
                 hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                
-                # Define broad skin color range in HSV
                 lower_skin = np.array([0, 20, 70], dtype=np.uint8)
                 upper_skin = np.array([25, 255, 255], dtype=np.uint8)
                 
                 mask = cv2.inRange(hsv, lower_skin, upper_skin)
-                
-                # Morphological operations to clean noise
                 kernel = np.ones((3,3), np.uint8)
                 mask = cv2.dilate(mask, kernel, iterations=2)
                 mask = cv2.erode(mask, kernel, iterations=1)
@@ -70,26 +66,24 @@ class HandTrackerThread(threading.Thread):
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
                 if contours:
-                    # Find the largest skin-colored contour (the player's hand/hands)
                     largest_contour = max(contours, key=cv2.contourArea)
                     area = cv2.contourArea(largest_contour)
                     
-                    if area > 3000: # Minimum size threshold to ignore tiny specks
+                    if area > 3000:
                         M = cv2.moments(largest_contour)
                         if M["m00"] > 0:
                             cx = int(M["m10"] / M["m00"])
                             cy = int(M["m01"] / M["m00"])
                             
-                            # Map X coordinate to steering (-1 to 1)
+                            # Draw live tracking visual on the webcam window so the user sees their hand being tracked!
+                            cv2.circle(frame, (cx, cy), 15, (0, 255, 0), -1)
+                            cv2.drawContours(frame, [largest_contour], -1, (255, 0, 0), 2)
+                            
+                            # Map coordinates
                             steering_val = max(-1.0, min(1.0, (cx - (w / 2)) / (w / 3.5)))
-                            
-                            # Map Y coordinate to throttle (higher up = faster, lower = slower)
                             throttle_val = max(0.2, min(1.0, 1.0 - (cy / h)))
-                            
-                            # If contour is large or moving fast, trigger boost
                             boost_active = True if area > 25000 else False
                     else:
-                        # Fallback to smooth neutral if hand is too far / small
                         steering_val = steering_val * 0.9
                         throttle_val = 0.5
                         boost_active = False
@@ -97,6 +91,12 @@ class HandTrackerThread(threading.Thread):
                     steering_val = steering_val * 0.9
                     throttle_val = 0.5
                     boost_active = False
+
+                # Show live OpenCV window with hand tracking visualizer!
+                cv2.imshow("Hand-Track Stunt Kart - Live Webcam Feed", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
             except Exception as e:
                 steering_val = 0.0
                 throttle_val = 0.5
@@ -104,6 +104,7 @@ class HandTrackerThread(threading.Thread):
 
             time.sleep(0.015)
         cap.release()
+        cv2.destroyAllWindows()
 
 tracker_thread = HandTrackerThread()
 tracker_thread.start()
@@ -212,10 +213,10 @@ menu_parent = Entity()
 hud_parent = Entity(enabled=False)
 
 title_text = Text(parent=menu_parent, text="HAND-TRACK STUNT KART", scale=3, origin=(0,0), y=0.3, color=color.orange)
-subtitle_text = Text(parent=menu_parent, text="Control your supercar using webcam hand tracking or WASD!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
+subtitle_text = Text(parent=menu_parent, text="Webcam tracker active with live visual feed window!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
 
 hud_speed = Text(parent=hud_parent, text="SPEED: 0 MPH", scale=1.5, position=(-0.85, 0.45), color=color.yellow)
-hud_status = Text(parent=hud_parent, text="Hand Tracking: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
+hud_status = Text(parent=hud_parent, text="Webcam Visualizer: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
 
 def start_singleplayer():
     global current_state, player_kart
@@ -245,7 +246,7 @@ def update():
             hud_status.text = "NITRO BOOST ACTIVE!"
             hud_status.color = color.magenta
         else:
-            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}% (Hand/WASD)"
+            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}% (Cam Active)"
             hud_status.color = color.green
 
 app.run()
