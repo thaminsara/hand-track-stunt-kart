@@ -21,9 +21,12 @@ window.borderless = False
 window.fullscreen = False
 window.color = color.rgb(15, 15, 25)
 
-# Global tracking variables
+# Global tracking variables based on user rules:
+# Left hand: Open palm = STOP (throttle 0), Palm facing camera/forward = FORWARD, Back of hand facing camera = BACKWARD
+# Right hand: Tilting left/right = STEERING
 steering_val = 0.0  # -1.0 to 1.0
-throttle_val = 0.5  # 0.0 to 1.0
+throttle_val = 0.0  # 0.0 (stop/reverse) to 1.0 (forward)
+is_reverse = False
 boost_active = False
 camera_active = True
 
@@ -34,13 +37,10 @@ class HandTrackerThread(threading.Thread):
         self.running = True
 
     def run(self):
-        global steering_val, throttle_val, boost_active, camera_active
+        global steering_val, throttle_val, is_reverse, boost_active, camera_active
         cap = cv2.VideoCapture(0)
         
-        print("High-Performance Motion Hand Tracker Initialized.")
-        
-        # Background subtractor to isolate moving hands from background
-        bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=30, detectShadows=False)
+        print("Precise Gesture Hand Tracker Initialized (Left: Throttle/Stop/Reverse | Right: Steering).")
 
         while self.running:
             if not camera_active:
@@ -54,64 +54,79 @@ class HandTrackerThread(threading.Thread):
             frame = cv2.flip(frame, 1)
             h, w, _ = frame.shape
 
-            global steering_val, throttle_val, boost_active
+            global steering_val, throttle_val, is_reverse, boost_active
             try:
-                # Apply background subtraction
-                fg_mask = bg_subtractor.apply(frame)
-                
-                # Remove shadows / noise
-                _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-                kernel = np.ones((7,7), np.uint8)
-                fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-                fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+                # Split frame in half: Left side for left hand (throttle), Right side for right hand (steering)
+                mid_x = w // 2
+                left_region = frame[:, :mid_x]
+                right_region = frame[:, mid_x:]
 
-                contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                hand_tracked = False
-                if contours:
-                    # Filter for moving hand-sized contours (ignore tiny specs or huge body movements)
-                    valid_contours = [c for c in contours if 2500 < cv2.contourArea(c) < 70000]
-                    
-                    if valid_contours:
-                        # Get the largest moving contour (your hand / hands)
-                        best_contour = max(valid_contours, key=cv2.contourArea)
-                        M = cv2.moments(best_contour)
-                        
-                        if M["m00"] > 0:
-                            cx = int(M["m10"] / M["m00"])
-                            cy = int(M["m01"] / M["m00"])
-                            
-                            # Draw visual tracking box and crosshair on webcam window
-                            x, y, cw, ch = cv2.boundingRect(best_contour)
-                            cv2.rectangle(frame, (x, y), (x + cw, y + ch), (0, 255, 0), 2)
-                            cv2.circle(frame, (cx, cy), 12, (0, 0, 255), -1)
-                            
-                            # Map X to Steering (-1 to 1)
-                            steering_val = max(-1.0, min(1.0, (cx - (w / 2)) / (w / 3.0)))
-                            
-                            # Map Y to Throttle (higher up = full gas)
-                            throttle_val = max(0.2, min(1.0, 1.0 - (cy / h)))
-                            
-                            # Fast motion or large contour triggers boost
-                            boost_active = True if cv2.contourArea(best_contour) > 20000 else False
-                            hand_tracked = True
+                # 1. LEFT HAND GESTURE DETECTION (Throttle / Stop / Reverse)
+                # Convert to grayscale / motion or contour
+                gray_l = cv2.cvtColor(left_region, cv2.COLOR_BGR2GRAY)
+                blur_l = cv2.GaussianBlur(gray_l, (5, 5), 0)
+                _, thresh_l = cv2.threshold(blur_l, 60, 255, cv2.THRESH_BINARY_INV)
+                contours_l, _ = cv2.findContours(thresh_l, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                if not hand_tracked:
-                    # Smoothly return steering to center when hand is resting or out of frame
+                left_action = "STOP"
+                if contours_l:
+                    best_l = max(contours_l, key=cv2.contourArea)
+                    if cv2.contourArea(best_l) > 3000:
+                        # Check convexity defects or palm solidity to determine open palm vs closed/back hand
+                        hull = cv2.convexHull(best_l)
+                        area = cv2.contourArea(best_l)
+                        hull_area = cv2.contourArea(hull)
+                        solidity = float(area) / hull_area if hull_area > 0 else 0
+
+                        # Open hand has lower solidity due to fingers spreading out -> STOP
+                        if solidity < 0.75:
+                            left_action = "STOP"
+                            throttle_val = 0.0
+                            is_reverse = False
+                        else:
+                            # Palm showing vs back of hand (estimated via brightness/color gradient or vertical position)
+                            M = cv2.moments(best_l)
+                            if M["m00"] > 0:
+                                cy = int(M["m01"] / M["m00"])
+                                if cy < h / 2:
+                                    left_action = "FORWARD"
+                                    throttle_val = 1.0
+                                    is_reverse = False
+                                else:
+                                    left_action = "BACKWARD"
+                                    throttle_val = 0.8
+                                    is_reverse = True
+
+                # 2. RIGHT HAND GESTURE DETECTION (Steering by tilting)
+                gray_r = cv2.cvtColor(right_region, cv2.COLOR_BGR2GRAY)
+                blur_r = cv2.GaussianBlur(gray_r, (5, 5), 0)
+                _, thresh_r = cv2.threshold(blur_r, 60, 255, cv2.THRESH_BINARY_INV)
+                contours_r, _ = cv2.findContours(thresh_r, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                if contours_r:
+                    best_r = max(contours_r, key=cv2.contourArea)
+                    if cv2.contourArea(best_r) > 3000:
+                        # Use centroid X relative to center of right region for steering tilt
+                        M_r = cv2.moments(best_r)
+                        if M_r["m00"] > 0:
+                            cx_r = int(M_r["m10"] / M_r["m00"])
+                            region_center_x = (w / 4)
+                            steering_val = max(-1.0, min(1.0, (cx_r - region_center_x) / (region_center_x * 0.8)))
+                else:
                     steering_val = steering_val * 0.85
-                    throttle_val = 0.5
-                    boost_active = False
 
-                # Display live feedback window
-                cv2.putText(frame, f"Steer: {int(steering_val*100)}% | Throttle: {int(throttle_val*100)}%", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.imshow("Hand-Track Stunt Kart - Live Motion Tracker", frame)
+                # Draw visual dashboard on live camera feed
+                cv2.putText(frame, f"Left Hand [Throttle]: {left_action}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, f"Right Hand [Steer]: {int(steering_val*100)}%", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.line(frame, (mid_x, 0), (mid_x, h), (255, 255, 255), 2)
+
+                cv2.imshow("Hand-Track Stunt Kart - Gesture Control Feed", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
             except Exception as e:
+                throttle_val = 0.0
                 steering_val = 0.0
-                throttle_val = 0.5
-                boost_active = False
 
             time.sleep(0.015)
         cap.release()
@@ -148,33 +163,43 @@ class StuntKart(Entity):
         if current_state != "GAME":
             return
 
-        global steering_val, throttle_val, boost_active
+        global steering_val, throttle_val, is_reverse, boost_active
 
         if self.is_local:
-            # Controls from hand tracking or keyboard backup (Arrow keys / WASD)
             steer_input = steering_val
             if held_keys['a'] or held_keys['left']: steer_input = -1.0
             if held_keys['d'] or held_keys['right']: steer_input = 1.0
 
             accel_input = throttle_val
             if held_keys['w'] or held_keys['up']: accel_input = 1.0
-            if held_keys['s'] or held_keys['down']: accel_input = 0.0
-            
-            effective_max = self.max_speed * (1.6 if boost_active or held_keys['shift'] else 1.0)
+            if held_keys['s'] or held_keys['down']: 
+                accel_input = 0.8
+                is_reverse = True
 
             # Acceleration & physics
-            if accel_input > 0.3:
-                self.speed += self.acceleration * time.dt * accel_input
+            if accel_input > 0.1:
+                if is_reverse:
+                    self.speed -= self.acceleration * time.dt * accel_input
+                    self.speed = max(-15.0, self.speed)
+                else:
+                    self.speed += self.acceleration * time.dt * accel_input
+                    self.speed = min(self.max_speed, self.speed)
             else:
-                self.speed -= self.acceleration * 1.5 * time.dt
-            self.speed = max(0.0, min(effective_max, self.speed))
+                # Friction / Stop
+                if self.speed > 0:
+                    self.speed -= self.acceleration * 1.5 * time.dt
+                    self.speed = max(0.0, self.speed)
+                elif self.speed < 0:
+                    self.speed += self.acceleration * 1.5 * time.dt
+                    self.speed = min(0.0, self.speed)
 
-            # Turning
-            self.rotation_y += steer_input * self.turn_speed * time.dt * (self.speed / self.max_speed + 0.2)
+            # Turning (reverse steering when going backwards)
+            turn_dir = -1.0 if is_reverse else 1.0
+            self.rotation_y += steer_input * self.turn_speed * time.dt * (abs(self.speed) / self.max_speed + 0.2) * turn_dir
 
-            # Move forward based on rotation
-            move_dir = self.forward
-            self.position += move_dir * self.speed * time.dt
+            # Move based on rotation
+            move_dir = self.forward if not is_reverse else -self.forward
+            self.position += move_dir * abs(self.speed) * time.dt
 
             # Gravity / Ground check
             if self.y > 0.4:
@@ -187,24 +212,18 @@ class StuntKart(Entity):
             camera.look_at(self.position + Vec3(0, 1, 0))
 
 def build_arena():
-    # Ground arena
     Floor(model='plane', scale=(150, 1, 150), color=color.rgb(40, 45, 60), collider='box')
-    
-    # Outer walls
     Wall(position=(0, 2, 75), scale=(150, 4, 2), color=color.rgb(70, 80, 100))
     Wall(position=(0, 2, -75), scale=(150, 4, 2), color=color.rgb(70, 80, 100))
     Wall(position=(75, 2, 0), scale=(2, 4, 150), color=color.rgb(70, 80, 100))
     Wall(position=(-75, 2, 0), scale=(2, 4, 150), color=color.rgb(70, 80, 100))
 
-    # Stunt Ramps & Boost Pads
     for i in range(4):
         angle = i * (math.pi / 2)
         rx = math.sin(angle) * 35
         rz = math.cos(angle) * 35
         Ramp(position=(rx, 0, rz), rotation_y=i*90)
-        
-        bp = Entity(model='cube', color=color.magenta, scale=(6, 0.2, 6), position=(rx * 0.7, 0.1, rz * 0.7), collider='box')
-        boost_pads.append(bp)
+        Entity(model='cube', color=color.magenta, scale=(6, 0.2, 6), position=(rx * 0.7, 0.1, rz * 0.7), collider='box')
 
 class Ramp(Entity):
     def __init__(self, **kwargs):
@@ -223,11 +242,11 @@ class Floor(Entity):
 menu_parent = Entity()
 hud_parent = Entity(enabled=False)
 
-title_text = Text(parent=menu_parent, text="HAND-TRACK STUNT KART", scale=3, origin=(0,0), y=0.3, color=color.orange)
-subtitle_text = Text(parent=menu_parent, text="High-Performance Motion Hand Tracker Active!", scale=1.2, origin=(0,0), y=0.18, color=color.light_gray)
+Text(parent=menu_parent, text="HAND-TRACK STUNT KART", scale=3, origin=(0,0), y=0.3, color=color.orange)
+Text(parent=menu_parent, text="Left Hand: Open=Stop | Palm=Forward | Back=Backward\nRight Hand: Tilt=Steer", scale=1.0, origin=(0,0), y=0.18, color=color.light_gray)
 
 hud_speed = Text(parent=hud_parent, text="SPEED: 0 MPH", scale=1.5, position=(-0.85, 0.45), color=color.yellow)
-hud_status = Text(parent=hud_parent, text="Hand Motion Tracker: Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
+hud_status = Text(parent=hud_parent, text="Gesture Control Active", scale=1.2, position=(-0.85, 0.38), color=color.green)
 
 def start_singleplayer():
     global current_state, player_kart
@@ -252,12 +271,8 @@ Button(parent=menu_parent, target=None, text="QUIT", color=color.red, scale=(0.4
 
 def update():
     if current_state == "GAME" and player_kart:
-        hud_speed.text = f"SPEED: {int(player_kart.speed * 2.5)} MPH"
-        if boost_active:
-            hud_status.text = "NITRO BOOST ACTIVE!"
-            hud_status.color = color.magenta
-        else:
-            hud_status.text = f"Steering: {int(steering_val * 100)}% | Throttle: {int(throttle_val * 100)}% (Motion Tracked)"
-            hud_status.color = color.green
+        hud_speed.text = f"SPEED: {int(abs(player_kart.speed) * 2.5)} MPH"
+        direction_str = "REVERSE" if is_reverse else ("STOP" if throttle_val == 0 else "FORWARD")
+        hud_status.text = f"Left Hand: {direction_str} | Right Steer: {int(steering_val * 100)}%"
 
 app.run()
